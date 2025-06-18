@@ -1,74 +1,86 @@
-import pika
+import os
 import json
+import asyncio
+import base64
 from io import BytesIO
 from PIL import Image
-from telegram import Bot
-import asyncio
-import logging
+from aiogram import Bot
+from aio_pika import connect_robust, IncomingMessage
 from dotenv import load_dotenv
-import os
+import logging
+from aiogram.types import BufferedInputFile
 
-logging.getLogger('pika').setLevel(logging.WARNING)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-
 load_dotenv()
-
 RABBITMQ_HOST = os.getenv('RABBITMQ_HOST')
 RABBITMQ_QUEUE = os.getenv('RABBITMQ_QUEUE')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_IDS = os.getenv('TELEGRAM_CHAT_IDS')
+TELEGRAM_CHAT_IDS = [chat_id.strip() for chat_id in os.getenv('TELEGRAM_CHAT_IDS').split(';')]
 
-CHAT_IDS = [chat_id.strip() for chat_id in TELEGRAM_CHAT_IDS.split(';')]
+bot = Bot(token=TELEGRAM_TOKEN)
 
-async def send_to_telegram(image_data, caption="Садка"):
+async def send_to_telegram(image_data: bytes, caption: str = "Садка"):
     try:
-        bot = Bot(token=TELEGRAM_TOKEN)
-        image = Image.open(BytesIO(image_data))
         output = BytesIO()
+        image = Image.open(BytesIO(image_data))
         image.save(output, format='JPEG')
-        for chat_id in CHAT_IDS:
+        output.seek(0)
+
+        for chat_id in TELEGRAM_CHAT_IDS:
             try:
+                buffered_file = BufferedInputFile(output.getvalue(), filename="image.jpg")
+                await bot.send_photo(chat_id=chat_id, photo=buffered_file, caption=caption)
+                logger.info(f"image sent to chat_id {chat_id}")
                 output.seek(0)
-                await bot.send_photo(chat_id=chat_id, photo=output, caption=caption)
-                logger.info("the image was successfully sent to tg with chat_id: %s", chat_id)
             except Exception as e:
-                logger.error(f"error sending to tg with chat_id: {chat_id}: {e}")
-                continue
+                logger.error(f"error sending image to {chat_id}: {e}")
         output.close()
-    except Exception as e:
-        logger.error(f"error sending to tg: {e}")
 
-def callback(ch, method, properties, body):
+    except Exception as e:
+        logger.error(f"error in send_to_telegram: {e}")
+
+async def callback(message: IncomingMessage):
+        try:
+            data = json.loads(message.body)
+            image_data = data.get("image")
+            metadata = data.get("metadata", {})
+            #caption = metadata.get("caption") текст сообщения
+            logger.info(f"received message with metadata: {metadata}")
+
+            if isinstance(image_data, str):
+                image_data = base64.b64decode(image_data)
+
+            await send_to_telegram(image_data)
+            await message.ack()
+
+        except Exception as e:
+            logger.error(f"error processing message: {e}")
+            await message.nack(requeue=True)
+
+async def main():
     try:
-        message = json.loads(body)
-        image_data = message.get('image')
-        metadata = message.get('metadata', {})
-        logger.info(f"message received: {metadata}")
+        connection = await connect_robust(RABBITMQ_HOST)
+        async with connection:
+            channel = await connection.channel()
+            async with channel:
+                await channel.set_qos(prefetch_count=1)
 
-        if isinstance(image_data, str):
-            import base64
-            image_data = base64.b64decode(image_data)
+                queue = await channel.declare_queue(RABBITMQ_QUEUE, durable=True)
+                logger.info("waiting for messages...")
 
-        asyncio.run(send_to_telegram(image_data))
-        ch.basic_ack(delivery_tag=method.delivery_tag)
+                await queue.consume(callback=callback)
+
+                await asyncio.Future()
+
     except Exception as e:
-        logger.error(f"error processing message: {e}")
-        ch.basic_nack(delivery_tag=method.delivery_tag)
+        logger.error(f"error during RabbitMQ processing: {e}")
 
-def main():
-    try:
-        with pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST)) as connection:
-            channel = connection.channel()
-            channel.queue_declare(queue=RABBITMQ_QUEUE, durable=True)
-            channel.basic_qos(prefetch_count=1)
-            channel.basic_consume(queue=RABBITMQ_QUEUE, on_message_callback=callback)
-            logger.info("waiting for messages")
-            channel.start_consuming()
-    except Exception as e:
-        logger.error(f"еrror connection to rabbit: {e}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("bot stopped")
