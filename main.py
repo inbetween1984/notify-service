@@ -3,9 +3,13 @@ import json
 import asyncio
 import base64
 from io import BytesIO
+
+import aiohttp
 from PIL import Image
-from aiogram import Bot
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import Message
 from aio_pika import connect_robust, IncomingMessage
+from aiogram.filters import Command
 from dotenv import load_dotenv
 import logging
 from aiogram.types import BufferedInputFile
@@ -21,6 +25,8 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_IDS = [chat_id.strip() for chat_id in os.getenv('TELEGRAM_CHAT_IDS').split(';')]
 
 bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
+
 
 async def send_to_telegram(image_data: bytes, caption: str = "Садка"):
     try:
@@ -60,6 +66,32 @@ async def callback(message: IncomingMessage):
             logger.error(f"error processing message: {e}")
             await message.nack(requeue=True)
 
+@dp.message(Command("export"))
+async def handle_export_command(message: Message):
+    export_url = "http://localhost:8000/actions/export"
+    request_payload = {
+        "entity_ids": ["1", "2"],
+        "actions": ["eat", "sleep", "drink"],
+        "start_time": "2025-06-23",
+        "end_time": "2025-06-25"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(export_url, json=request_payload) as resp:
+                if resp.status == 200:
+                    content = await resp.read()
+                    excel_file = BufferedInputFile(content, filename="export.xlsx")
+                    await message.answer_document(excel_file, caption="Вот ваш экспортированный файл Excel 📊")
+                    logger.info(f"Excel файл отправлен пользователю {message.from_user.id}")
+                else:
+                    error_text = f"Не удалось получить данные. Статус: {resp.status}"
+                    await message.answer(error_text)
+                    logger.error(error_text)
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении запроса к API: {e}")
+        await message.answer("Произошла ошибка при обращении к API.")
+
 async def main():
     try:
         connection = await connect_robust(RABBITMQ_HOST)
@@ -78,9 +110,12 @@ async def main():
     except Exception as e:
         logger.error(f"error during RabbitMQ processing: {e}")
 
+async def start():
+    asyncio.create_task(main())
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(start())
     except (KeyboardInterrupt, SystemExit):
         logger.info("bot stopped")
