@@ -6,7 +6,7 @@ from io import BytesIO
 
 import aiohttp
 from PIL import Image
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 from aio_pika import connect_robust, IncomingMessage
 from aiogram.filters import Command
@@ -66,6 +66,7 @@ async def callback(message: IncomingMessage):
             logger.error(f"error processing message: {e}")
             await message.nack(requeue=True)
 
+
 @dp.message(Command("export"))
 async def handle_export_command(message: Message):
     export_url = "http://localhost:8000/actions/export"
@@ -111,8 +112,15 @@ async def main():
         logger.error(f"error during RabbitMQ processing: {e}")
 
 async def start():
-    asyncio.create_task(main())
-    await dp.start_polling(bot)
+    rabbitmq_task = asyncio.create_task(main())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        rabbitmq_task.cancel()
+        try:
+            await rabbitmq_task
+        except asyncio.CancelledError:
+            logger.info("RabbitMQ task cancelled")
 
 if __name__ == "__main__":
     try:
